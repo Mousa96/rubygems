@@ -29,20 +29,29 @@ module Bench
 
     def start
       @server = TCPServer.new("127.0.0.1", 0)
+      @port = @server.addr[1]
       @thread = Thread.new do
-        loop { Thread.new(@server.accept) {|client| serve(client) } }
-      rescue IOError
-        # the listening socket was closed by #shutdown
+        until @stopping
+          client = @server.accept
+          @stopping ? client.close : Thread.new(client) {|c| serve(c) }
+        end
       ensure
-        # Any other failure stops the server, so that the measured command
-        # fails at once instead of waiting on a socket nobody accepts.
+        # Closing on every exit, a failed accept included, makes the measured
+        # command fail at once instead of waiting on a socket nobody accepts.
         @server.close
       end
-      "http://127.0.0.1:#{@server.addr[1]}"
+      "http://127.0.0.1:#{@port}"
     end
 
+    # Closing the socket from another thread does not wake a blocked accept on
+    # every Ruby (TruffleRuby on Linux hung here), so a connection wakes it.
     def shutdown
-      @server&.close
+      return unless @thread
+      @stopping = true
+      TCPSocket.new("127.0.0.1", @port).close
+    rescue SystemCallError
+      # the accept loop has already stopped and closed the socket
+    ensure
       @thread&.join
     end
 
@@ -66,7 +75,8 @@ module Bench
     end
 
     def specs_from(index)
-      entries = File.foreach(index, chomp: true).map do |line|
+      # File.foreach without a block passes chomp: on as a line limit on JRuby.
+      entries = File.readlines(index, chomp: true).map do |line|
         name, token, rest = line.split(" ", 3)
         version, platform = token.split("-", 2)
         deps, requirements = rest.to_s.split("|", 2)
