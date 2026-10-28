@@ -39,7 +39,12 @@ module Gem
       # A quoted mapping key followed by ":". A whole-line quoted scalar
       # cannot match because its closing quote is at the end of the line.
       QUOTED_KEY_RE = /^("(?:[^"\\]|\\.)*"|'(?:[^']|'')*'):(?:[ ]+(.*))?$/
+      # An entry of a flow sequence. A quoted entry may contain commas.
+      FLOW_SEQUENCE_ENTRY_RE = /"(?:[^"\\]|\\.)*"|'(?:[^']|'')*'|[^,\s](?:[^,]*[^,\s])?/
       MAX_NESTING_DEPTH = 1_000
+      NULL_SCALARS = %w[~ null].freeze
+      BLANK_RE = /\A[\0\s]*\z/
+      BLANK_OR_COMMENT_RE = /\A[\0\s]*(?:#|\z)/
 
       STRING_UNESCAPES = {
         "\\\\" => "\\",
@@ -53,6 +58,10 @@ module Gem
         "\\f" => "\f",
         "\\r" => "\r",
         "\\e" => "\e",
+        "\\N" => "\u0085",
+        "\\_" => "\u00A0",
+        "\\L" => "\u2028",
+        "\\P" => "\u2029",
       }.freeze
 
       def initialize(source)
@@ -142,6 +151,8 @@ module Gem
       def parse_sequence(indent, anchor)
         items = []
         while @lines.any?
+          skip_blank_and_comments
+          break if @lines.empty?
           line = @lines[0]
           stripped = line.lstrip
           break unless line.size - stripped.size == indent &&
@@ -158,6 +169,7 @@ module Gem
         if content.start_with?("*")
           parse_inline_alias(content)
         elsif content.empty?
+          skip_blank_and_comments
           @lines.any? && current_indent > indent ? parse_node(indent) : nil
         elsif content.start_with?("!ruby/object:")
           parse_tagged_content(content.strip, indent)
@@ -180,6 +192,8 @@ module Gem
       def parse_mapping(indent, anchor)
         pairs = []
         while @lines.any?
+          skip_blank_and_comments
+          break if @lines.empty?
           line = @lines[0]
           stripped = line.lstrip
           break unless line.size - stripped.size == indent
@@ -212,6 +226,7 @@ module Gem
         elsif val.start_with?("!binary ")
           parse_binary_value(val, indent)
         elsif val.empty?
+          skip_blank_and_comments
           next_stripped = nil
           next_indent = nil
           if @lines.any?
@@ -259,11 +274,14 @@ module Gem
 
       def parse_block_scalar(base_indent, modifier)
         parts = []
-        block_indent = nil
+        indentation = modifier[/\A[+-]?([1-9])/, 1]
+        chomping = modifier[/\A[1-9]?([+-])/, 1]
+        block_indent = indentation && base_indent + indentation.to_i
 
         while @lines.any?
           line = @lines[0]
           if line.strip.empty?
+            parts << line[block_indent..] if block_indent && line.size > block_indent
             parts << "\n"
             @lines.shift
           else
@@ -275,18 +293,16 @@ module Gem
         end
 
         res = parts.join
-        res.chomp! if modifier == "-" && res.end_with?("\n")
+        res.delete_suffix!("\n") while chomping == "-" && res.end_with?("\n")
         res
       end
 
       def parse_plain_scalar(indent, anchor)
-        result = coerce(@lines.shift.strip)
+        val = @lines.shift.strip
+        result = coerce(val)
         return register_anchor(anchor, result) if result.is_a?(Mapping) || result.is_a?(Sequence)
 
-        while result.is_a?(String) && @lines.any? &&
-              !@lines[0].strip.empty? && current_indent > indent
-          result << " " << @lines.shift.strip
-        end
+        fold_continuation_lines(result, val, indent)
         register_anchor(anchor, Scalar.new(value: result))
       end
 
@@ -294,11 +310,18 @@ module Gem
         result = coerce(val)
         return result if result.is_a?(Mapping) || result.is_a?(Sequence)
 
-        while result.is_a?(String) && @lines.any? &&
-              !@lines[0].strip.empty? && current_indent > indent
+        fold_continuation_lines(result, val, indent)
+        Scalar.new(value: result)
+      end
+
+      def fold_continuation_lines(result, val, indent)
+        return unless result.is_a?(String)
+
+        # "#" does not start a comment inside a quoted scalar that runs onto the next lines.
+        stop = val.start_with?("'", "\"") && result == val ? BLANK_RE : BLANK_OR_COMMENT_RE
+        while @lines.any? && !stop.match?(@lines[0]) && current_indent > indent
           result << " " << @lines.shift.strip
         end
-        Scalar.new(value: result)
       end
 
       def coerce(val, depth = 0)
@@ -307,8 +330,11 @@ module Gem
         val = val.sub(/^! /, "") if val.start_with?("! ")
 
         if val =~ /^"(.*)"$/
-          $1.gsub(/\\(?:["\\0abtnvfre]|x\h{2})/) do |m|
-            STRING_UNESCAPES[m] || m[2..].to_i(16).chr(Encoding::UTF_8)
+          inner = $1
+          inner.gsub(/\\(?:["\\0abtnvfreN_LP]|x\h{2}|u\h{4}|U\h{8})/) do |m|
+            char = STRING_UNESCAPES[m] || unescape_code_point(m)
+            # Metadata is read as binary, where non-ASCII text stays as UTF-8 bytes.
+            Encoding.compatible?(inner, char) ? char : char.b
           end
         elsif val =~ /^'(.*)'$/
           $1.gsub(/''/, "'")
@@ -316,14 +342,14 @@ module Gem
           true
         elsif val == "false"
           false
-        elsif ["~", "null"].include?(val)
+        elsif NULL_SCALARS.include?(val)
           nil
         elsif val == "{}"
           Mapping.new
         elsif val =~ /^\[(.*)\]$/
           inner = $1.strip
           return Sequence.new if inner.empty?
-          items = inner.split(/\s*,\s*/).reject(&:empty?).map {|e| Scalar.new(value: coerce(e, depth + 1)) }
+          items = inner.scan(FLOW_SEQUENCE_ENTRY_RE).map {|e| Scalar.new(value: coerce(e, depth + 1)) }
           Sequence.new(items: items)
         elsif /\A\d{4}-\d{2}-\d{2}([ T]\d{2}:\d{2}:\d{2})?/.match?(val)
           begin
@@ -341,6 +367,12 @@ module Gem
         else
           val
         end
+      end
+
+      def unescape_code_point(escape)
+        code = escape[2..].hex
+        return escape if code > 0x10FFFF || code.between?(0xD800, 0xDFFF)
+        code.chr(Encoding::UTF_8)
       end
 
       def decode_binary_tag(str)
@@ -414,12 +446,7 @@ module Gem
       end
 
       def skip_blank_and_comments
-        while @lines.any?
-          line = @lines[0]
-          stripped = line.lstrip
-          break unless stripped.empty? || stripped.start_with?("#")
-          @lines.shift
-        end
+        @lines.shift while @lines.any? && BLANK_OR_COMMENT_RE.match?(@lines[0])
       end
 
       def strip_comment(val)
